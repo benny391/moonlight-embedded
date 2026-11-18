@@ -37,10 +37,12 @@
 #define MAX_FB 64
 /* Connectors on a meson SoC: composite, HDMI and optionally CVBS/component. */
 #define MAX_CONN 8
-/* Flips kept outstanding; the display retires them one per refresh. One is
- * enough: every extra pending flip is a whole refresh of added latency, and a
- * remote-desktop client would rather skip a frame than show a stale one. */
-#define MAX_INFLIGHT_DEFAULT 1
+/* Flips kept outstanding; the display retires them one per refresh. Zero
+ * selects the overwrite mode: the newest frame is presented, and if the
+ * previous flip has not been latched yet the new frame is dropped rather than
+ * queued behind it. Queueing is what turns a one-refresh offset into a stable
+ * two-refresh offset at 60 fps on a 60 Hz panel, so the default is to skip. */
+#define MAX_INFLIGHT_DEFAULT 0
 #define MAX_INFLIGHT_LIMIT 8
 /* How long the very first frames may block waiting for the VPU. */
 #define FIRST_FRAME_WAIT_MS 500
@@ -68,6 +70,9 @@ static int max_inflight = MAX_INFLIGHT_DEFAULT;
 
 /* Rolling presentation stats, printed with the fps line every 5s. */
 static long st_shown, st_drop, st_peak_pending, st_waited;
+/* Packets in / frames out per window. pkts == deq proves the client is a pure
+ * passthrough and the frame rate is decided by the host, not by the decoder. */
+static long st_pkts, st_deq, st_fail;
 static long tot_shown, tot_drop;
 /* Decoder latency: feed() has taken the packet, how long until a raw frame
  * comes back. This is the only part of the client pipeline a different OS could
@@ -713,8 +718,8 @@ int drm_video_init_codec(int width, int height, int codec) {
   {
     const char *q = getenv("MOONLIGHT_MAX_INFLIGHT");
     int v = q ? atoi(q) : MAX_INFLIGHT_DEFAULT;
-    if (v < 1)
-      v = 1;
+    if (v < 0)
+      v = 0;
     if (v > MAX_INFLIGHT_LIMIT)
       v = MAX_INFLIGHT_LIMIT;
     max_inflight = v;
@@ -789,6 +794,8 @@ int drm_video_submit(const unsigned char *data, int length) {
   if (!active)
     return -1;
 
+  st_pkts++;
+
   /* Collect any flip that finished while we were idle. Without this the event
    * sits in the DRM fd until the next packet arrives, which both delays buffer
    * reuse and inflates the measured latency by a whole packet interval. */
@@ -824,6 +831,7 @@ int drm_video_submit(const unsigned char *data, int length) {
                                                     : FRAME_WAIT_MS);
     if (idx <= 0)
       break;
+    st_deq++;
     if (shown == 0 && newest < 0) {
       double dec = (now_s() - t_feed) * 1000.0;
       if (dec > 0) {
@@ -855,12 +863,26 @@ int drm_video_submit(const unsigned char *data, int length) {
       return -1;
     }
 
-    /* Never queue behind more than max_inflight outstanding flips. */
-    while (icount >= max_inflight) {
-      st_waited++;
-      if (wait_flip(100) <= 0)
-        break;
-      retire_one();
+    /* max_inflight == 0 is the overwrite mode: never queue behind a flip that
+     * has not been latched yet. Queueing costs a whole extra refresh per entry
+     * and at 60 fps on a 60 Hz panel never drains again, so the frame is
+     * dropped instead and the pipeline stays one deep. */
+    if (max_inflight == 0) {
+      while (icount > 0 && wait_flip(0) > 0)
+        retire_one();
+      if (icount > 0) {
+        st_drop++;
+        tot_drop++;
+        v4l2m2m_release(newest);
+        goto stats;
+      }
+    } else {
+      while (icount >= max_inflight) {
+        st_waited++;
+        if (wait_flip(100) <= 0)
+          break;
+        retire_one();
+      }
     }
     if (icount > st_peak_pending)
       st_peak_pending = icount;
@@ -901,14 +923,19 @@ int drm_video_submit(const unsigned char *data, int length) {
       } else {
         /* the display has not retired the previous flip yet */
         st_waited++;
+        st_fail++;
         if (wait_flip(60) > 0)
           retire_one();
       }
     }
-    if (!ok)
+    if (!ok) {
+      st_fail++;
       v4l2m2m_release(newest);
+    }
   }
 
+stats:
+  ;
   /* A rolling 5s frame count is the only honest way to tell whether the box is
    * really presenting at the stream's rate after a mode change. */
   static time_t fps_t0;
@@ -922,14 +949,15 @@ int drm_video_submit(const unsigned char *data, int length) {
     long retired = st_shown > 0 ? st_shown : 1;
     fprintf(stderr,
             "DRM: %.1f fps at %dx%d pending<=%ld/%d drop=%ld "
-            "lat=%.1fms max=%.1fms dec=%.1fms\n",
+            "lat=%.1fms max=%.1fms dec=%.1fms pkts=%ld deq=%ld fail=%ld\n",
             (double)fps_n / (double)(now - fps_t0), mode.hdisplay,
             mode.vdisplay, st_peak_pending, max_inflight, st_drop,
             st_lat_sum / (double)retired, st_lat_max,
-            st_dec_sum / (double)retired);
+            st_dec_sum / (double)retired, st_pkts, st_deq, st_fail);
     fps_t0 = now;
     fps_n = 0;
     st_shown = st_drop = st_peak_pending = st_waited = 0;
+    st_pkts = st_deq = st_fail = 0;
     st_lat_sum = st_lat_max = 0;
     st_dec_sum = 0;
   }
