@@ -92,6 +92,32 @@ static int vid_w, vid_h;
  * however long the fd sat unread. */
 static double last_flip_ts;
 
+/* Phase probe.
+ *
+ * drmCrtcGetSequence reports the last vblank's counter and its timestamp on the
+ * same CLOCK_MONOTONIC base the page-flip event uses, so the distance from a
+ * commit to the next vblank boundary is measurable instead of guessed from the
+ * latency it later shows up as. A frame only makes the coming refresh if the
+ * commit lands before the CRTC's internal deadline; the margin at commit time
+ * is therefore the number that separates hits from misses, and the split of
+ * hits against misses per margin bin is what a phase lock has to be built on.
+ */
+static int vseq_ok = 1;              /* cleared if the driver says no */
+static int have_vseq;
+static uint64_t vseq_last;
+static double vns_last;
+static double period_ms = 16.667;    /* refined from the vblank timestamps */
+static long period_n;
+
+/* per-frame probe values, retired together with the frame */
+static double inflight_margin[MAX_FB];  /* ms from commit to next vblank */
+static double inflight_pred[MAX_FB];    /* predicted latch time (monotonic s) */
+
+static long st_hit, st_miss, st_drop_ovw, st_drop_stale;
+static double st_hit_msum, st_hit_mmin, st_miss_msum, st_miss_mmax;
+static long st_hit_n, st_miss_n;
+static long tot_hit, tot_miss, tot_drop_ovw, tot_drop_stale;
+
 /*
  * Stall watchdog.
  *
@@ -133,6 +159,36 @@ static double now_s(void) {
   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* Sample the CRTC's vblank counter. Returns 0, and switches itself off for
+ * good, when the driver does not implement GET_SEQUENCE. */
+static int vblank_sample(uint64_t *seq, double *vns) {
+  if (!vseq_ok)
+    return 0;
+  struct drm_crtc_get_sequence gs = { .crtc_id = crtc_id };
+  if (ioctl(dfd, DRM_IOCTL_CRTC_GET_SEQUENCE, &gs) != 0 ||
+      gs.sequence_ns <= 0) {
+    vseq_ok = 0;
+    fprintf(stderr, "DRM: vblank probe unsupported, phase stats disabled\n");
+    return 0;
+  }
+  *seq = gs.sequence;
+  *vns = (double)gs.sequence_ns / 1e9;
+
+  /* Two samples roughly one refresh apart give the real period, which is not
+   * necessarily what htotal*vtotal/clock claims. */
+  if (have_vseq && *seq > vseq_last && *seq - vseq_last < 4) {
+    double p = (*vns - vns_last) * 1000.0 / (double)(*seq - vseq_last);
+    if (p > 5.0 && p < 40.0) {
+      period_ms += (p - period_ms) * 0.1;
+      period_n++;
+    }
+  }
+  have_vseq = 1;
+  vseq_last = *seq;
+  vns_last = *vns;
+  return 1;
+}
+
 /* Decode-to-scanout time for one frame, measured when it is retired. */
 static void account_flip(void) {
   if (icount <= 0)
@@ -147,6 +203,27 @@ static void account_flip(void) {
     if (lat > tot_lat_max)
       tot_lat_max = lat;
   }
+  /* Did this commit make the very next refresh, or slip a whole period? The
+   * event timestamp is the vblank the frame was latched at, so comparing it
+   * with the predicted one answers that without ambiguity. */
+  if (inflight_pred[0] > 0) {
+    double d = (ts - inflight_pred[0]) * 1000.0;
+    if (d < period_ms * 0.5) {
+      st_hit++;
+      st_hit_n++;
+      tot_hit++;
+      st_hit_msum += inflight_margin[0];
+      if (inflight_margin[0] < st_hit_mmin)
+        st_hit_mmin = inflight_margin[0];
+    } else {
+      st_miss++;
+      st_miss_n++;
+      tot_miss++;
+      st_miss_msum += inflight_margin[0];
+      if (inflight_margin[0] > st_miss_mmax)
+        st_miss_mmax = inflight_margin[0];
+    }
+  }
   st_shown++;
   tot_shown++;
 }
@@ -158,6 +235,9 @@ static void retire_one(void) {
   v4l2m2m_release(inflight[0]);
   memmove(inflight, inflight + 1, (icount - 1) * sizeof(int));
   memmove(inflight_t, inflight_t + 1, (icount - 1) * sizeof(double));
+  memmove(inflight_margin, inflight_margin + 1,
+          (icount - 1) * sizeof(double));
+  memmove(inflight_pred, inflight_pred + 1, (icount - 1) * sizeof(double));
   icount--;
 }
 
@@ -500,6 +580,14 @@ static int setup_kms(void) {
   }
   printf("DRM: connector %u, mode %dx%d@%d\n", conn_id, mode.hdisplay,
          mode.vdisplay, mode.vrefresh);
+
+  /* Seed the phase probe with the mode's nominal period (clock is in kHz, so
+   * htotal*vtotal/clock is already milliseconds); the vblank timestamps refine
+   * it at runtime. */
+  if (mode.clock > 0 && mode.htotal > 0 && mode.vtotal > 0)
+    period_ms = (double)((long)mode.htotal * (long)mode.vtotal) /
+                (double)mode.clock;
+  st_hit_mmin = 1e9;
 
   /* Remember every other connector that is still bound to a CRTC so the first
    * atomic commit can detach it. */
@@ -851,7 +939,9 @@ int drm_video_submit(const unsigned char *data, int length) {
     if (newest > 0) {
       v4l2m2m_release(newest);
       st_drop++;
+      st_drop_stale++;
       tot_drop++;
+      tot_drop_stale++;
     }
     newest = idx;
     newest_t = now_s();
@@ -872,7 +962,9 @@ int drm_video_submit(const unsigned char *data, int length) {
         retire_one();
       if (icount > 0) {
         st_drop++;
+        st_drop_ovw++;
         tot_drop++;
+        tot_drop_ovw++;
         v4l2m2m_release(newest);
         goto stats;
       }
@@ -904,6 +996,19 @@ int drm_video_submit(const unsigned char *data, int length) {
       uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK | DRM_MODE_PAGE_FLIP_EVENT;
       if (!committed_once)
         flags |= DRM_MODE_ATOMIC_ALLOW_MODESET;
+
+      /* How long is there left before the next vblank boundary? Negative
+       * margins cannot happen, but a margin inside the CRTC deadline is what
+       * makes a frame slip a whole period. */
+      double t_commit = now_s();
+      double pred = 0.0, margin = 0.0;
+      uint64_t vseq;
+      double vns;
+      if (vblank_sample(&vseq, &vns)) {
+        pred = vns + period_ms / 1000.0;
+        margin = (pred - t_commit) * 1000.0;
+      }
+
       int rc = drmModeAtomicCommit(dfd, r, flags, NULL);
       drmModeAtomicFree(r);
 
@@ -916,6 +1021,8 @@ int drm_video_submit(const unsigned char *data, int length) {
         if (icount < MAX_FB) {
           inflight[icount] = newest;
           inflight_t[icount] = newest_t;
+          inflight_margin[icount] = margin;
+          inflight_pred[icount] = pred;
           icount++;
         } else {
           v4l2m2m_release(newest);
@@ -948,18 +1055,29 @@ stats:
   else if (now - fps_t0 >= 15) {
     long retired = st_shown > 0 ? st_shown : 1;
     fprintf(stderr,
-            "DRM: %.1f fps at %dx%d pending<=%ld/%d drop=%ld "
-            "lat=%.1fms max=%.1fms dec=%.1fms pkts=%ld deq=%ld fail=%ld\n",
+            "DRM: %.1f fps at %dx%d pending<=%ld/%d drop=%ld(ovw %ld/stale %ld) "
+            "lat=%.1fms max=%.1fms dec=%.1f/%.1fms pkts=%ld deq=%ld fail=%ld "
+            "per=%.2f hit=%ld miss=%ld mhit=%.1f/%.1f mmiss=%.1f/%.1f\n",
             (double)fps_n / (double)(now - fps_t0), mode.hdisplay,
             mode.vdisplay, st_peak_pending, max_inflight, st_drop,
+            st_drop_ovw, st_drop_stale,
             st_lat_sum / (double)retired, st_lat_max,
-            st_dec_sum / (double)retired, st_pkts, st_deq, st_fail);
+            st_dec_sum / (double)retired, st_dec_max, st_pkts, st_deq, st_fail,
+            period_ms, st_hit, st_miss,
+            st_hit_n ? st_hit_msum / (double)st_hit_n : 0.0,
+            st_hit_n ? st_hit_mmin : 0.0,
+            st_miss_n ? st_miss_msum / (double)st_miss_n : 0.0,
+            st_miss_mmax);
     fps_t0 = now;
     fps_n = 0;
-    st_shown = st_drop = st_peak_pending = st_waited = 0;
+    st_shown = st_drop = st_drop_ovw = st_drop_stale = 0;
+    st_peak_pending = st_waited = 0;
     st_pkts = st_deq = st_fail = 0;
     st_lat_sum = st_lat_max = 0;
-    st_dec_sum = 0;
+    st_dec_sum = st_dec_max = 0;
+    st_hit = st_miss = st_hit_n = st_miss_n = 0;
+    st_hit_msum = st_miss_msum = st_miss_mmax = 0;
+    st_hit_mmin = 1e9;
   }
 
   return shown;
@@ -980,10 +1098,13 @@ void drm_video_cleanup(void) {
 
   if (tot_shown > 0)
     fprintf(stderr,
-            "DRM: presented %ld frames, dropped %ld, decode->scanout avg %.1fms "
-            "max %.1fms, decoder avg %.1fms (queue %d)\n",
-            tot_shown, tot_drop, tot_lat_sum / (double)tot_shown, tot_lat_max,
-            tot_dec_sum / (double)tot_shown, max_inflight);
-  tot_shown = tot_drop = 0;
+            "DRM: presented %ld frames, dropped %ld (overwrite %ld, stale %ld), "
+            "decode->scanout avg %.1fms max %.1fms, decoder avg %.1fms "
+            "(queue %d, hit %ld miss %ld)\n",
+            tot_shown, tot_drop, tot_drop_ovw, tot_drop_stale,
+            tot_lat_sum / (double)tot_shown, tot_lat_max,
+            tot_dec_sum / (double)tot_shown, max_inflight, tot_hit, tot_miss);
+  tot_shown = tot_drop = tot_hit = tot_miss = 0;
+  tot_drop_ovw = tot_drop_stale = 0;
   tot_lat_sum = tot_lat_max = tot_dec_sum = 0;
 }
