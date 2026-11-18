@@ -231,3 +231,29 @@ add_subdirectory(docs)
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(FILES ./third_party/SDL_GameControllerDB/gamecontrollerdb.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
 install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR})
+
+# --- NV12 -> YUV420P conversion for V4L2 M2M hardware decoders ---
+if (ENABLE_FFMPEG)
+  pkg_check_modules(SWSCALE libswscale)
+  if (SWSCALE_FOUND)
+    target_link_libraries(moonlight ${SWSCALE_LIBRARIES})
+  else ()
+    message(WARNING "libswscale not found: hardware decoder output cannot be converted")
+  endif ()
+endif ()
+
+
+
+# --- DRM/KMS zero-copy output for V4L2 M2M hardware decoders ---
+if (ENABLE_SDL)
+  target_sources(moonlight PRIVATE ./src/video/v4l2m2m.c)
+  pkg_check_modules(DRM libdrm)
+  if (DRM_FOUND)
+    target_sources(moonlight PRIVATE ./src/video/drmzero.c)
+    target_include_directories(moonlight PRIVATE ${DRM_INCLUDE_DIRS})
+    target_link_libraries(moonlight ${DRM_LIBRARIES})
+    target_compile_definitions(moonlight PRIVATE HAVE_DRM_ZEROCOPY)
+  else ()
+    message(WARNING "libdrm not found: DRM zero-copy output disabled")
+  endif ()
+endif ()

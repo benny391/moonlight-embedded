@@ -20,6 +20,7 @@
 #include "audio.h"
 
 #include <SDL.h>
+#include <stdlib.h>
 #include <SDL_audio.h>
 
 #include <stdio.h>
@@ -48,7 +49,20 @@ static int sdl_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURA
   want.freq = opusConfig->sampleRate;
   want.format = AUDIO_S16LSB;
   want.channels = opusConfig->channelCount;
-  want.samples = 4096;
+  /* The default 4096 frame period makes ALSA hand out an 8192 frame ring
+   * buffer, i.e. ~170ms of queued audio while the picture is only one refresh
+   * behind. On a TV whose speakers share the HDMI link that reads as sound
+   * trailing the picture, so use a much shorter period. Tunable for A/B tests
+   * because too small a buffer shows up as crackle on a busy box. */
+  {
+    const char *env = getenv("MOONLIGHT_AUDIO_SAMPLES");
+    int nsamp = env != NULL ? atoi(env) : 1024;
+    if (nsamp < 256)
+      nsamp = 256;
+    if (nsamp > 4096)
+      nsamp = 4096;
+    want.samples = (Uint16)nsamp;
+  }
 
   dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
   if (dev == 0) {
