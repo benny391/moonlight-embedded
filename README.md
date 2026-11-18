@@ -9,6 +9,9 @@
 > stays out of tree and is not proposed for merge. The device configuration that
 > goes with it lives in
 > [Moonlight-on-S905L3A-Armbian](https://github.com/benny391/Moonlight-on-S905L3A-Armbian).
+> Measured there on a 1440p60 H.265 stream to a 4K60 output: decode-to-scanout
+> 6.4 ms mean / 4.8 ms median (decoder 0.3-0.8 ms), at the cost of ~1.5% of
+> frames being repeated in one burst every 2 minutes.
 
  [![Build](https://img.shields.io/github/actions/workflow/status/moonlight-stream/moonlight-embedded/build.yml?branch=master)](https://github.com/moonlight-stream/moonlight-embedded/actions/workflows/build.yml?query=branch%3Amaster) [Nightly Build Downloads](https://nightly.link/moonlight-stream/moonlight-embedded/workflows/build/master)
 
