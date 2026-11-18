@@ -914,9 +914,15 @@ int drm_video_submit(const unsigned char *data, int length) {
   int newest = -1;
 
   for (;;) {
-    int idx = v4l2m2m_dequeue_raw(
-        shown == 0 && newest < 0 && !committed_once ? FIRST_FRAME_WAIT_MS
-                                                    : FRAME_WAIT_MS);
+    /* Once a frame is in hand there is nothing to wait for: the only reason to
+     * look again is to discard a second, staler frame, and that either comes
+     * back immediately or not at all. Blocking 8 ms to discover it did not
+     * arrive delayed every single commit by 8 ms (measured as a constant
+     * lat - mhit = 8.1 ms). Waiting is only needed while no frame exists yet:
+     * half a second for the very first one, one frame time in steady state. */
+    int wait_ms = newest > 0 ? 0
+                 : (committed_once ? FRAME_WAIT_MS : FIRST_FRAME_WAIT_MS);
+    int idx = v4l2m2m_dequeue_raw(wait_ms);
     if (idx <= 0)
       break;
     st_deq++;
