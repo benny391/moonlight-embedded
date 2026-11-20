@@ -122,6 +122,11 @@ static double inflight_margin[MAX_FB];  /* ms from commit to next vblank */
 static double inflight_pred[MAX_FB];    /* predicted latch time (monotonic s) */
 
 static long st_hit, st_miss, st_drop_ovw, st_drop_stale;
+/* Diagnostic only: for every frame the overwrite mode throws away, how much
+ * longer would we have had to wait for the flip that was holding us up?
+ * Buckets (ms): <1, 1-2, 2-4, 4-8, >=8. If most of the mass sits in a bucket
+ * above MOONLIGHT_OVW_WAIT_MS, the bounded wait is too short to rescue them. */
+static long st_need[5];
 static double st_hit_msum, st_hit_mmin, st_miss_msum, st_miss_mmax;
 static long st_hit_n, st_miss_n;
 static long tot_hit, tot_miss, tot_drop_ovw, tot_drop_stale;
@@ -997,6 +1002,23 @@ int drm_video_submit(const unsigned char *data, int length) {
         st_drop_ovw++;
         tot_drop++;
         tot_drop_ovw++;
+        {
+          uint64_t ds;
+          double dv;
+          if (vblank_sample(&ds, &dv)) {
+            double need = ((dv + period_ms / 1000.0) - now_s()) * 1000.0;
+            if (need < 1.0)
+              st_need[0]++;
+            else if (need < 2.0)
+              st_need[1]++;
+            else if (need < 4.0)
+              st_need[2]++;
+            else if (need < 8.0)
+              st_need[3]++;
+            else
+              st_need[4]++;
+          }
+        }
         v4l2m2m_release(newest);
         goto stats;
       }
@@ -1089,7 +1111,8 @@ stats:
     fprintf(stderr,
             "DRM: %.1f fps at %dx%d pending<=%ld/%d drop=%ld(ovw %ld/stale %ld) "
             "lat=%.1fms max=%.1fms dec=%.1f/%.1fms pkts=%ld deq=%ld fail=%ld "
-            "per=%.2f hit=%ld miss=%ld mhit=%.1f/%.1f mmiss=%.1f/%.1f\n",
+            "per=%.2f hit=%ld miss=%ld mhit=%.1f/%.1f mmiss=%.1f/%.1f "
+            "need<%ld|%ld|%ld|%ld|%ld\n",
             (double)fps_n / (double)(now - fps_t0), mode.hdisplay,
             mode.vdisplay, st_peak_pending, max_inflight, st_drop,
             st_drop_ovw, st_drop_stale,
@@ -1099,7 +1122,8 @@ stats:
             st_hit_n ? st_hit_msum / (double)st_hit_n : 0.0,
             st_hit_n ? st_hit_mmin : 0.0,
             st_miss_n ? st_miss_msum / (double)st_miss_n : 0.0,
-            st_miss_mmax);
+            st_miss_mmax, st_need[0], st_need[1], st_need[2], st_need[3],
+            st_need[4]);
     fps_t0 = now;
     fps_n = 0;
     st_shown = st_drop = st_drop_ovw = st_drop_stale = 0;
@@ -1110,6 +1134,7 @@ stats:
     st_hit = st_miss = st_hit_n = st_miss_n = 0;
     st_hit_msum = st_miss_msum = st_miss_mmax = 0;
     st_hit_mmin = 1e9;
+    st_need[0] = st_need[1] = st_need[2] = st_need[3] = st_need[4] = 0;
   }
 
   return shown;
