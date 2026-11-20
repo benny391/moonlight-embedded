@@ -44,6 +44,13 @@
  * two-refresh offset at 60 fps on a 60 Hz panel, so the default is to skip. */
 #define MAX_INFLIGHT_DEFAULT 0
 #define MAX_INFLIGHT_LIMIT 8
+
+/* How long a frame that would be overwritten may wait for the previous flip
+ * to latch before it is given up on. A frame that arrives a hair before the
+ * latch is worth a millisecond or two of patience: presenting it one refresh
+ * later keeps motion continuous and costs no extra input latency, because the
+ * alternative is not showing it at all. 0 restores drop-immediately. */
+#define OVW_WAIT_MS_DEFAULT 2
 /* How long the very first frames may block waiting for the VPU. */
 #define FIRST_FRAME_WAIT_MS 500
 /* HEVC decodes with more latency than H.264; draining on a zero timeout
@@ -67,6 +74,7 @@ static int inflight[MAX_FB];
 static double inflight_t[MAX_FB];   /* when the frame was decoded */
 static int icount;
 static int max_inflight = MAX_INFLIGHT_DEFAULT;
+static int ovw_wait_ms = OVW_WAIT_MS_DEFAULT;
 
 /* Rolling presentation stats, printed with the fps line every 5s. */
 static long st_shown, st_drop, st_peak_pending, st_waited;
@@ -812,6 +820,15 @@ int drm_video_init_codec(int width, int height, int codec) {
       v = MAX_INFLIGHT_LIMIT;
     max_inflight = v;
   }
+  {
+    const char *q = getenv("MOONLIGHT_OVW_WAIT_MS");
+    int v = q ? atoi(q) : OVW_WAIT_MS_DEFAULT;
+    if (v < 0)
+      v = 0;
+    if (v > 16)
+      v = 16;
+    ovw_wait_ms = v;
+  }
   printf("DRM: zero-copy %dx%d -> %dx%d at %d,%d (framebuffers lazy)\n",
          vid_w, vid_h, dst_w, dst_h, dst_x, dst_y);
   return 0;
@@ -966,6 +983,15 @@ int drm_video_submit(const unsigned char *data, int length) {
     if (max_inflight == 0) {
       while (icount > 0 && wait_flip(0) > 0)
         retire_one();
+      if (icount > 0 && ovw_wait_ms > 0) {
+        /* The previous flip is still armed, so this frame would be thrown
+         * away. Give that flip a bounded chance to latch first: the frame is
+         * then presented one refresh later instead of vanishing. */
+        if (wait_flip(ovw_wait_ms) > 0)
+          retire_one();
+        while (icount > 0 && wait_flip(0) > 0)
+          retire_one();
+      }
       if (icount > 0) {
         st_drop++;
         st_drop_ovw++;
