@@ -32,6 +32,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #define SLICES_PER_FRAME 4
 // How long we are willing to wait for the VPU to hand back a decoded frame
@@ -47,6 +48,37 @@ typedef enum {
 static void* decode_buffer;
 static size_t decode_buffer_size;
 static backend_t backend = BACKEND_NONE;
+
+/* moonlight-common-c frame timing, microseconds */
+static double st_recv_sum, st_recv_max;
+static double st_queue_sum, st_queue_max;
+static double st_host_sum, st_host_max;
+static long st_net_n, st_host_n;
+static time_t net_t0;
+
+static void net_stats_maybe_print(void) {
+  time_t now = time(NULL);
+  if (net_t0 == 0) { net_t0 = now; return; }
+  if (now - net_t0 < 15) return;
+
+  long n = st_net_n > 0 ? st_net_n : 1;
+  uint32_t rtt = 0, rttv = 0;
+  LiGetEstimatedRttInfo(&rtt, &rttv);
+
+  fprintf(stderr,
+          "NET: recv=%.2f/%.2fms queue=%.2f/%.2fms "
+          "host=%.2f/%.2fms rtt=%u/%ums n=%ld\n",
+          st_recv_sum / n, st_recv_max,
+          st_queue_sum / n, st_queue_max,
+          st_host_n ? st_host_sum / st_host_n : 0.0, st_host_max,
+          rtt, rttv, st_net_n);
+
+  net_t0 = now;
+  st_recv_sum = st_recv_max = 0;
+  st_queue_sum = st_queue_max = 0;
+  st_host_sum = st_host_max = 0;
+  st_net_n = st_host_n = 0;
+}
 
 static int sdl_setup(int videoFormat, int width, int height, int redrawRate, void* context, int drFlags) {
   backend = BACKEND_NONE;
@@ -150,6 +182,29 @@ static void push_frame(unsigned char** planes, int* strides) {
 }
 
 static int sdl_submit_decode_unit(PDECODE_UNIT decodeUnit) {
+  net_stats_maybe_print();
+
+  uint64_t now_us = LiGetMicroseconds();
+  double recv_ms = 0, queue_ms = 0, host_ms = 0;
+
+  if (decodeUnit->enqueueTimeUs >= decodeUnit->receiveTimeUs)
+    recv_ms = (double)(decodeUnit->enqueueTimeUs -
+                       decodeUnit->receiveTimeUs) / 1000.0;
+  if (now_us >= decodeUnit->enqueueTimeUs)
+    queue_ms = (double)(now_us - decodeUnit->enqueueTimeUs) / 1000.0;
+  host_ms = (double)decodeUnit->frameHostProcessingLatency / 10.0;
+
+  st_net_n++;
+  st_recv_sum += recv_ms;
+  if (recv_ms > st_recv_max) st_recv_max = recv_ms;
+  st_queue_sum += queue_ms;
+  if (queue_ms > st_queue_max) st_queue_max = queue_ms;
+  if (host_ms > 0) {
+    st_host_n++;
+    st_host_sum += host_ms;
+    if (host_ms > st_host_max) st_host_max = host_ms;
+  }
+
   PLENTRY entry = decodeUnit->bufferList;
   int length = 0;
 
